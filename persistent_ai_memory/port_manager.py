@@ -311,6 +311,29 @@ class PortManager:
         if self.active_port is None:
             logger.error("Cannot save port info: active_port not set")
             return False
+
+        info_file = self.memory_data_path / self.PORT_INFO_FILENAME
+
+        # PAMS-RACE-005: claim discipline. Short-lived MCP spawns used to
+        # overwrite the shared record and die, leaving a live heartbeat on a
+        # corpse claim. Never clobber a claim whose owner is still alive —
+        # the persistent daemon's heartbeat owns that record. Our sidecar
+        # still binds its own (free) port; it just doesn't advertise itself
+        # as THE server.
+        try:
+            if info_file.exists():
+                prior = json.loads(info_file.read_text(encoding="utf-8"))
+                prior_pid = prior.get("process_id")
+                if (prior.get("status") == "active"
+                        and isinstance(prior_pid, int)
+                        and prior_pid != self.process_id
+                        and psutil.pid_exists(prior_pid)):
+                    logger.info(
+                        "Port record owned by live pid %s; not overwriting "
+                        "(our sidecar: %s)", prior_pid, self.active_port)
+                    return True
+        except Exception as _e:
+            logger.warning("Could not inspect prior port claim: %s", _e)
         
         try:
             port_info = {
@@ -322,8 +345,6 @@ class PortManager:
                 "http_url": f"http://127.0.0.1:{self.active_port}",
                 "status": "active"
             }
-            
-            info_file = self.memory_data_path / self.PORT_INFO_FILENAME
             
             with open(info_file, 'w') as f:
                 json.dump(port_info, f, indent=2)
