@@ -7881,6 +7881,7 @@ Return JSON:
                         conn.row_factory = sqlite3.Row
 
                         sql = """SELECT memory_id, content, importance_level, tags, memory_type,
+                                memory_bank,
                                 timestamp_created, timestamp_updated, source_conversation_id,
                                 user_id, model_id, embedding
                                 FROM curated_memories WHERE 1=1"""
@@ -7889,20 +7890,44 @@ Return JSON:
                         if user_id:
                             sql += " AND (user_id = ? OR user_id IS NULL)"
                             params.append(user_id)
+                        # SEARCH-002 sibling: never let an unknown model_id
+                        # silently zero the date-range recall either.
                         if model_id:
-                            sql += " AND model_id = ?"
-                            params.append(model_id)
+                            _m = conn.execute(
+                                "SELECT 1 FROM curated_memories WHERE model_id = ? LIMIT 1",
+                                (model_id,)).fetchone()
+                            if _m:
+                                sql += " AND model_id = ?"
+                                params.append(model_id)
+                            else:
+                                logger.info(
+                                    "by_date: model_id %r absent in %s; no model filter",
+                                    model_id, db_path)
                         if ts_start:
                             sql += " AND CAST(strftime('%s', timestamp_created) AS INTEGER) >= ?"
                             params.append(ts_start)
                         if ts_end:
                             sql += " AND CAST(strftime('%s', timestamp_created) AS INTEGER) <= ?"
                             params.append(ts_end)
+                        # BANKS-003 sibling: filter on the real memory_bank
+                        # column, not memory_type. Pre-migration shards lack
+                        # the column; fall back to the legacy predicate there.
+                        _bank_fallback = False
                         if memory_bank:
-                            sql += " AND memory_type = ?"
+                            sql += " AND memory_bank = ?"
                             params.append(memory_bank)
 
-                        rows = conn.execute(sql, params).fetchall()
+                        try:
+                            rows = conn.execute(sql, params).fetchall()
+                        except sqlite3.OperationalError as _oe:
+                            if "memory_bank" not in str(_oe):
+                                raise
+                            _bank_fallback = True
+                            sql = sql.replace(" AND memory_bank = ?",
+                                              " AND memory_type = ?")
+                            sql = sql.replace("memory_type,\n                                memory_bank,",
+                                              "memory_type,")
+                            rows = conn.execute(sql, params).fetchall()
                         conn.close()
 
                         for row in rows:
@@ -7933,6 +7958,8 @@ Return JSON:
                                     "importance_level": row["importance_level"],
                                     "tags": row_tags,
                                     "memory_type": row["memory_type"],
+                                    "memory_bank": (row["memory_bank"]
+                                                    if not _bank_fallback else None),
                                     "timestamp_created": row["timestamp_created"],
                                     "source_conversation_id": row["source_conversation_id"],
                                     "user_id": row["user_id"],
