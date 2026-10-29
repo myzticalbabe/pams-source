@@ -1193,16 +1193,39 @@ class AIMemoryMCPServer:
         try:
             from pathlib import Path
             import json
-            
-            # Load the memory_bank registry
-            registry_path = Path(self.memory_data_dir) / "memory_bank_registry.json"
-            
-            if registry_path.exists():
-                with open(registry_path, 'r') as f:
-                    registry = json.load(f)
-            else:
-                logger.warning(f"Memory bank registry not found at {registry_path}")
-                registry = {}
+
+            # PAMS-BANKS-003: the registry FILE drifts from the table it claims
+            # to describe (proven 2026-10-29: file said 87 across 5 banks,
+            # table says 119 across 2). Read the live table first; the file
+            # is fallback only (e.g. shards predating the memory_bank column).
+            registry = {}
+            registry_source = "registry_file"
+            try:
+                live_rows = await self.memory_system.ai_memories_db.execute_query(
+                    "SELECT memory_bank, COUNT(*) AS count FROM curated_memories "
+                    "GROUP BY memory_bank", ())
+                if live_rows:
+                    for row in live_rows:
+                        _bank = row.get("memory_bank") if isinstance(row, dict) else row["memory_bank"]
+                        _count = row.get("count") if isinstance(row, dict) else row["count"]
+                        registry[_bank or "General"] = {
+                            "name": _bank or "General",
+                            "memory_count": _count,
+                        }
+                    registry_source = "live_table"
+            except Exception as live_exc:
+                logger.warning(f"Live bank query failed, falling back to registry file: {live_exc}")
+
+            if not registry:
+                # Load the memory_bank registry
+                registry_path = Path(self.memory_data_dir) / "memory_bank_registry.json"
+                
+                if registry_path.exists():
+                    with open(registry_path, 'r') as f:
+                        registry = json.load(f)
+                else:
+                    logger.warning(f"Memory bank registry not found at {registry_path}")
+                    registry = {}
             
             if not registry:
                 logger.info("Memory bank registry is empty or not found")
@@ -1220,6 +1243,7 @@ class AIMemoryMCPServer:
                 "banks": registry,
                 "total_memories": total_memories,
                 "bank_count": len(registry),
+                "source": registry_source,
                 "model_id": model_id,
                 "user_id": user_id
             }

@@ -8210,9 +8210,11 @@ Return JSON:
                 canonical_tags = [t.lower() for t in tags]
         
         for result in all_results:
-            # Check memory_bank filter (exact match if specified)
+            # Check memory_bank filter (exact match if specified).
+            # PAMS-BANKS-003: filter on the real memory_bank field; fall back
+            # to memory_type only for results that predate the column.
             if memory_bank:
-                result_bank = result["data"].get("memory_type")  # memory_bank is stored in memory_type column
+                result_bank = result["data"].get("memory_bank") or result["data"].get("memory_type")
                 if result_bank != memory_bank:
                     continue
             
@@ -8700,7 +8702,10 @@ Return JSON:
             cursor = conn.cursor()
             
             # Build SQL query with optional filters
-            sql = "SELECT memory_id, timestamp_created, timestamp_updated, source_conversation_id, memory_type, user_id, model_id, content, importance_level, tags, embedding FROM curated_memories WHERE embedding IS NOT NULL"
+            # PAMS-BANKS-003: select the real memory_bank column. Shards that
+            # predate the migration lack it; fall back to the legacy list.
+            _bank_col_present = True
+            sql = "SELECT memory_id, timestamp_created, timestamp_updated, source_conversation_id, memory_type, memory_bank, user_id, model_id, content, importance_level, tags, embedding FROM curated_memories WHERE embedding IS NOT NULL"
             params = []
 
             # Only add filters if user/model provided
@@ -8742,7 +8747,14 @@ Return JSON:
                 sql += " AND memory_type = ?"
                 params.append(memory_type)
             
-            cursor.execute(sql, params)
+            try:
+                cursor.execute(sql, params)
+            except sqlite3.OperationalError as _oe:
+                if "memory_bank" not in str(_oe):
+                    raise
+                _bank_col_present = False
+                sql = sql.replace(", memory_bank,", ",")
+                cursor.execute(sql, params)
             rows = cursor.fetchall()
             conn.close()
             
@@ -8771,6 +8783,14 @@ Return JSON:
                                 if match:
                                     memory_type = match.group(1).strip()
                             
+                            # PAMS-BANKS-003: expose the real memory_bank column instead
+                            # of letting callers mistake memory_type for a bank.
+                            # Content-embedded [Memory Bank:] is the legacy fallback.
+                            _bank_col = row["memory_bank"] if _bank_col_present else None
+                            if not _bank_col and "[Memory Bank:" in content:
+                                _bm = re.search(r'\[Memory Bank:\s*([^\]]+)\]', content)
+                                if _bm:
+                                    _bank_col = _bm.group(1).strip()
                             result = {
                                 "type": "ai_memory",
                                 "similarity_score": similarity,
@@ -8780,6 +8800,7 @@ Return JSON:
                                     "timestamp_updated": row["timestamp_updated"],
                                     "source_conversation_id": row["source_conversation_id"],
                                     "memory_type": memory_type,
+                                    "memory_bank": _bank_col,
                                     "content": content,
                                     "importance_level": row["importance_level"],
                                     "tags": tags,
