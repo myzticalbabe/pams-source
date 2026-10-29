@@ -3568,3 +3568,53 @@ if __name__ == "__main__":
 
 
 
+
+
+# ============================================================
+# PAMS PATCH: Monitoring autostart (reinstall-survival)
+# Schedules file-monitoring startup on every server instance.
+# ============================================================
+def _pams_monitoring_autostart(cls):
+    import asyncio
+    import logging
+    original = getattr(cls, "__init__", None)
+    if not cls or not original or getattr(cls, "_pams_monitor_autostart", False):
+        return False
+    try:
+        delay = float(os.environ.get("PAMS_MONITOR_DELAY", "15"))
+    except ValueError:
+        delay = 15.0
+
+    @functools.wraps(original)
+    def __init__(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _delayed_monitor_start():
+            await asyncio.sleep(delay)
+            log = logging.getLogger(__name__)
+            try:
+                await self.memory_system._start_monitoring()
+                log.info("File monitoring autostarted by pams_server_launcher")
+            except Exception as exc:
+                fm = getattr(self.memory_system, "file_monitor", None)
+                n = len(getattr(fm, "observers", None) or [])
+                if n:
+                    log.info("File monitoring autostarted (%d observers; "
+                             "ensure_databases raised: %s)" % (n, exc))
+                else:
+                    print("[pams] monitoring autostart failed: %s" % exc,
+                          file=sys.stderr)
+
+        loop.create_task(_delayed_monitor_start())
+
+    cls.__init__ = __init__
+    cls._pams_monitor_autostart = True
+    return True
+
+# Apply monitoring autostart on import
+_pams_monitoring_autostart(AIMemoryMCPServer)
+

@@ -18,6 +18,7 @@ import sqlite3
 import json
 import uuid
 import logging
+import functools
 import aiohttp
 import numpy as np
 import hashlib
@@ -4705,6 +4706,42 @@ class EmbeddingService:
             embeddings.append(embedding)
         
         return embeddings
+
+
+
+# ============================================================
+# PAMS PATCH: Embedding resilience (reinstall-survival)
+# Truncate-and-retry for long texts, reject zero vectors.
+# ============================================================
+def _pams_embedding_resilience(cls):
+    original = getattr(cls, "generate_embedding", None)
+    if original is None or getattr(cls, "_pams_embed_resilient", False):
+        return False
+
+    @functools.wraps(original)
+    async def _generate_embedding(self, text, *args, **kwargs):
+        attempt = text
+        for _ in range(7):
+            vector = await original(self, attempt, *args, **kwargs)
+            if vector is not None:
+                try:
+                    if any(vector):
+                        return vector
+                except TypeError:
+                    return vector
+            if not isinstance(attempt, str) or len(attempt) < 300:
+                break
+            attempt = attempt[: int(len(attempt) * 0.6)]
+            print("[pams] embedding rejected (%d chars); retrying with %d"
+                  % (len(text), len(attempt)), file=sys.stderr)
+        return None
+
+    cls.generate_embedding = _generate_embedding
+    cls._pams_embed_resilient = True
+    return True
+
+# Apply embedding resilience on import
+_pams_embedding_resilience(EmbeddingService)
 
 
 class AIMemorySystem:
@@ -10267,3 +10304,221 @@ if __name__ == "__main__":
         await memory_system.stop_file_monitoring()
         
         logger.warning(f"\n✅ Test completed!")
+
+
+# ============================================================
+# PAMS PATCH: Registry builder repair (reinstall-survival)
+# Replaces broken _build_memory_bank_registries and _build_tag_registries
+# that used sqlite3.Row.get() which doesn't exist.
+# ============================================================
+def _pams_registry_builder_repair(cls):
+    if cls is None or getattr(cls, "_pams_registry_repaired", False):
+        return False
+
+    async def _build_memory_bank_registries(self):
+        path = PAMS_DATA / "memory_bank_registry.json"
+        res = {"main_registry_path": str(path), "docker_registry_path": str(path),
+               "banks_found": 0, "total_memories": 0, "errors": []}
+        try:
+            rows = await self.memory_system.ai_memory_db.execute_query(
+                "SELECT memory_bank, COUNT(*) AS count FROM curated_memories "
+                "GROUP BY memory_bank", ())
+            registry = {}
+            for row in rows:
+                bank = row["memory_bank"] or "General"
+                count = row["count"] or 0
+                registry[bank] = {"name": bank, "memory_count": count}
+                res["total_memories"] += count
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(registry, indent=2, sort_keys=True),
+                            encoding="utf-8")
+            res["banks_found"] = len(registry)
+        except Exception as exc:
+            res["errors"].append(str(exc))
+        return res
+
+    async def _build_tag_registries(self):
+        path = PAMS_DATA / "tag_registry.json"
+        res = {"main_registry_path": str(path), "docker_registry_path": str(path),
+               "tags_found": 0, "memories_scanned": 0, "errors": []}
+        try:
+            from tag_manager import TagManager
+
+            rows = await self.memory_system.ai_memory_db.execute_query(
+                "SELECT memory_id, content, tags FROM curated_memories", ())
+            memories = [dict(row) for row in rows]
+            res["memories_scanned"] = len(memories)
+            if memories:
+                manager = TagManager()
+                registry = manager.build_tag_registry(memories)
+                res["tags_found"] = len(registry)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                manager.save_registry(registry, str(path))
+                try:
+                    res["summary"] = manager.get_registry_summary()
+                except Exception:
+                    pass
+        except Exception as exc:
+            res["errors"].append(str(exc))
+        return res
+
+    cls._build_memory_bank_registries = _build_memory_bank_registries
+    cls._build_tag_registries = _build_tag_registries
+    cls._pams_registry_repaired = True
+    return True
+
+# Apply registry builder repair on import
+_pams_registry_builder_repair(DatabaseMaintenance)
+
+
+
+# ============================================================
+# PAMS PATCH: Boost retune (reinstall-survival)
+# Halves importance_boost on both search paths so similarity decides.
+# ============================================================
+def _pams_boost_retune(cls):
+    if not cls or getattr(cls, "_pams_boost_retuned", False):
+        return False
+    try:
+        new_insights = float(os.environ.get("PAMS_BOOST_INSIGHTS", "0.07"))
+        new_memories = float(os.environ.get("PAMS_BOOST_MEMORIES", "0.05"))
+    except ValueError:
+        new_insights, new_memories = 0.07, 0.05
+    targets = {
+        "_search_project_insights": (0.15, new_insights),
+        "_search_ai_memories": (0.10, new_memories),
+    }
+    patched = 0
+    for name, (old_f, new_f) in targets.items():
+        original = getattr(cls, name, None)
+        if not original:
+            print("[pams] boost retune skipped: no %s" % name, file=sys.stderr)
+            continue
+
+        async def _wrapped(self, *args, _orig=original, _old=old_f,
+                           _new=new_f, **kwargs):
+            results = await _orig(self, *args, **kwargs)
+            try:
+                for r in results or []:
+                    try:
+                        lvl = (r.get("data") or {}).get("importance_level", 5)
+                        base = r.get("similarity_score", 0) or 0
+                        r["similarity_score"] = (
+                            base - lvl / 10.0 * _old + lvl / 10.0 * _new
+                        )
+                    except Exception:
+                        continue
+                results.sort(
+                    key=lambda x: x.get("similarity_score", 0), reverse=True
+                )
+            except Exception as exc:
+                print("[pams] boost resort skipped: %s" % exc, file=sys.stderr)
+            return results
+
+        setattr(cls, name, _wrapped)
+        patched += 1
+    cls._pams_boost_retuned = patched == len(targets)
+    return cls._pams_boost_retuned
+
+# Apply boost retune on import
+_pams_boost_retune(AIMemorySystem)
+
+
+
+# ============================================================
+# PAMS PATCH: Promote guard (reinstall-survival)
+# Demotes bus-telemetry content to importance 2 at create_memory choke point.
+# ============================================================
+import re
+_BUS_TOPIC_RE = None
+
+def _bus_topic_re():
+    global _BUS_TOPIC_RE
+    if _BUS_TOPIC_RE is None:
+        _BUS_TOPIC_RE = re.compile(
+            r"cluster\.(execute|nature)\.|lane\.|monitor\.|bus\.monitor",
+            re.IGNORECASE,
+        )
+    return _BUS_TOPIC_RE
+
+def _pams_promote_guard(cls):
+    original = getattr(cls, "create_memory", None)
+    if not cls or not original or getattr(cls, "_pams_promote_guarded", False):
+        return False
+
+    @functools.wraps(original)
+    async def create_memory(self, *args, **kwargs):
+        def _get(name, idx, default):
+            if name in kwargs:
+                return kwargs[name]
+            if len(args) > idx:
+                return args[idx]
+            return default
+
+        def _set(args, kwargs, name, idx, value):
+            if name in kwargs or len(args) <= idx:
+                kwargs[name] = value
+                return args, kwargs
+            return args[:idx] + (value,) + args[idx + 1:], kwargs
+
+        try:
+            content = _get("content", 0, "")
+            tags = _get("tags", 3, None)
+            importance = _get("importance_level", 2, 5)
+            haystack = str(content or "") + " " + " ".join(tags or [])
+            if _bus_topic_re().search(haystack) and (importance or 5) >= 5:
+                args, kwargs = _set(args, kwargs, "importance_level", 2, 2)
+                if not _get("memory_type", 1, None):
+                    args, kwargs = _set(args, kwargs, "memory_type", 1, "telemetry")
+                t = list(_get("tags", 3, None) or [])
+                if "bus-telemetry-guarded" not in t:
+                    t.append("bus-telemetry-guarded")
+                args, kwargs = _set(args, kwargs, "tags", 3, t)
+                print("[pams] promote guard: bus-telemetry content demoted "
+                      "to importance 2 (was %s)" % importance, file=sys.stderr)
+        except Exception as exc:
+            print("[pams] promote guard bypassed: %s" % exc, file=sys.stderr)
+        return await original(self, *args, **kwargs)
+
+    cls.create_memory = create_memory
+    cls._pams_promote_guarded = True
+    return True
+
+# Apply promote guard on import
+_pams_promote_guard(AIMemorySystem)
+
+
+
+# ============================================================
+# PAMS PATCH: Caller identity preservation (reinstall-survival)
+# Fixes get_system_health to use real caller from _CALLER context.
+# ============================================================
+def _pams_caller_identity(cls):
+    original = getattr(cls, "get_system_health", None)
+    if not cls or not original or getattr(cls, "_pams_caller_patched", False):
+        return False
+
+    @functools.wraps(original)
+    async def _get_system_health(self, user_id=None, model_id=None, **kwargs):
+        caller = _CALLER.get()
+        if caller:
+            caller_user, caller_model = caller
+            user_id = user_id or caller_user
+            model_id = model_id or caller_model
+        return await original(self, user_id=user_id, model_id=model_id, **kwargs)
+
+    try:
+        cls.get_system_health = _get_system_health
+        cls._pams_caller_patched = True
+    except Exception as exc:
+        print("[pams] caller identity patch skipped: %s" % exc, file=sys.stderr)
+        return False
+    return True
+
+# _CALLER context var (set by launcher's _execute_tool wrapper)
+import contextvars
+_CALLER = contextvars.ContextVar("pams_caller", default=None)
+
+# Apply caller identity patch on import
+_pams_caller_identity(AIMemorySystem)
+
