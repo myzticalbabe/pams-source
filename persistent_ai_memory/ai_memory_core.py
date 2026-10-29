@@ -8154,11 +8154,18 @@ Return JSON:
             all_results.extend(conversation_results)
 
         # Search AI memories
+        search_notes = []
         if database_filter in ["all", "ai_memories"]:
             memory_results = await self._search_ai_memories(
                 query_embedding, limit * 2, min_importance, max_importance, memory_type,
                 user_id=user_id, model_id=model_id
             )
+            # New shape: (results, notes). Tolerate legacy bare list.
+            if isinstance(memory_results, tuple) and len(memory_results) == 2:
+                memory_results, _notes = memory_results
+                _scope = (_notes or {}).get("model_id_scope")
+                if _scope:
+                    search_notes.append(_scope)
             all_results.extend(memory_results)
             
         # Search OpenWebUI short-term memories
@@ -8251,7 +8258,7 @@ Return JSON:
         # Sort all results by similarity score and return top results
         all_results.sort(key=lambda x: x["similarity_score"], reverse=True)
         
-        return {
+        _response = {
             "status": "success",
             "query": query,
             "results": all_results[:limit],
@@ -8265,6 +8272,10 @@ Return JSON:
                 "memory_bank": memory_bank
             }
         }
+        # PAMS-SEARCH-002: surface scope relaxations instead of hiding them.
+        if search_notes:
+            _response["notes"] = search_notes
+        return _response
     
 
     async def _get_memory_by_id(self, memory_id: str) -> Dict:
@@ -8514,12 +8525,22 @@ Return JSON:
             tasks.append(task)
 
         db_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # PAMS-SEARCH-002: track shards where an unknown model_id filter was
+        # skipped so the caller can report scope instead of silently zeroing.
+        model_scope_skipped = []
         
         # Merge results from all databases
-        for result in db_results:
+        for db_path, result in zip(memory_db_paths, db_results):
             if isinstance(result, Exception):
                 logger.error(f"Error searching AI memory DB: {result}")
                 continue
+
+            # New shape: (results, model_filter_skipped). Tolerate legacy list.
+            if isinstance(result, tuple) and len(result) == 2:
+                result, skipped = result
+                if skipped:
+                    model_scope_skipped.append(str(db_path))
 
             for mem_result in result:
                 mem_id = mem_result["data"]["memory_id"]
@@ -8541,7 +8562,15 @@ Return JSON:
         
         # Sort by similarity and return top results
         all_results.sort(key=lambda x: x["similarity_score"], reverse=True)
-        return all_results[:limit]
+        if model_scope_skipped:
+            return all_results[:limit], {
+                "model_id_scope": (
+                    f"model_id '{model_id}' not present in "
+                    f"{len(model_scope_skipped)} shard(s); "
+                    "searched across all models instead"
+                )
+            }
+        return all_results[:limit], {}
     
     async def _search_openwebui_memories(
         self,
@@ -8679,9 +8708,27 @@ Return JSON:
                 sql += " AND (user_id = ? OR user_id IS NULL)"
                 params.append(user_id)
 
+            # PAMS-SEARCH-002: exact model_id scoping silently zeroed recall
+            # for any caller whose model name was never stored (proven 2026-10-29:
+            # model_id='inward' matched 0 of 119 curated rows). Only apply the
+            # filter when the value actually occurs in this shard; otherwise
+            # search across models. user_id scoping is intentional (identity
+            # boundary) and stays strict.
+            model_filter_skipped = False
             if model_id:
-                sql += " AND model_id = ?"
-                params.append(model_id)
+                _exists = cursor.execute(
+                    "SELECT 1 FROM curated_memories WHERE model_id = ? LIMIT 1",
+                    (model_id,),
+                ).fetchone()
+                if _exists:
+                    sql += " AND model_id = ?"
+                    params.append(model_id)
+                else:
+                    model_filter_skipped = True
+                    logger.info(
+                        "model_id %r not present in %s; searching across all models",
+                        model_id, Path(db_path).name,
+                    )
             
             if min_importance is not None:
                 sql += " AND importance_level >= ?"
@@ -8745,11 +8792,11 @@ Return JSON:
                         logger.error(f"Error processing row from {Path(db_path).name}: {e}")
                         continue
             
-            return results
+            return results, model_filter_skipped
             
         except Exception as e:
             logger.error(f"Error searching AI memory DB {db_path}: {e}")
-            return []
+            return [], False
 
     
     async def _search_schedule(self, query_embedding: List[float], limit: int) -> List[Dict]:
