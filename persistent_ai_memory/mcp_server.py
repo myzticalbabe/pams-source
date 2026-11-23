@@ -8,6 +8,7 @@ while maintaining client-specific access controls.
 """
 
 import asyncio
+import functools
 import logging
 
 # Configure logging first so we can use it immediately
